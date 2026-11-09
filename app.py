@@ -109,15 +109,7 @@ def init_db():
             unit_price_mxn INTEGER NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS order_items(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id INTEGER NOT NULL,
-            pizza_id TEXT NOT NULL,
-            pizza_name TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            unit_price_mxn INTEGER NOT NULL,
-            FOREIGN KEY(order_id) REFERENCES orders(id)
-        );
+        
 
         CREATE TABLE IF NOT EXISTS deliveries(
             id SERIAL PRIMARY KEY,
