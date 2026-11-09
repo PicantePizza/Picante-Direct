@@ -3,6 +3,9 @@ from functools import wraps
 from datetime import datetime
 import os
 import secrets
+import json
+import urllib.request
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("APP_SECRET", "change-this-before-deployment")
@@ -95,6 +98,25 @@ def init_db():
             driver_id INTEGER,
             claimed_at TEXT,
             created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS order_items(
+            id SERIAL PRIMARY KEY,
+            order_id INTEGER NOT NULL,
+            pizza_id TEXT NOT NULL,
+            pizza_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            unit_price_mxn INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS order_items(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            pizza_id TEXT NOT NULL,
+            pizza_name TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            unit_price_mxn INTEGER NOT NULL,
+            FOREIGN KEY(order_id) REFERENCES orders(id)
         );
 
         CREATE TABLE IF NOT EXISTS deliveries(
@@ -414,6 +436,75 @@ button.orange {
 def page(content):
     return render_template_string(BASE, content=content)
 
+
+# =========================================================
+# CUSTOMER DELIVERY HANDOFF / ORDERING
+# =========================================================
+
+PGP_MENU_URL = os.environ.get("PGP_MENU_URL", "https://picante-whatsapp-bot.onrender.com/pd/menu")
+
+def get_pgp_menu():
+    try:
+        with urllib.request.urlopen(PGP_MENU_URL, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            if data.get("items"):
+                return data["items"]
+    except Exception as exc:
+        print(f"PGP menu fetch failed: {exc}")
+    return [
+        {"id":"pepperoni","name_en":"Pepperoni","name_es":"Pepperoni","price_mxn":175},
+        {"id":"hawaiian","name_en":"Hawaiian","name_es":"Hawaiana","price_mxn":175},
+        {"id":"bacon_mushroom_onion_jalapeno","name_en":"Bacon, Mushroom, Onion & Jalapeño","name_es":"Tocino, Champiñón, Cebolla y Jalapeño","price_mxn":175},
+        {"id":"margherita","name_en":"Margherita","name_es":"Margarita","price_mxn":175},
+        {"id":"meat_lovers","name_en":"Meat Lovers","name_es":"Meat Lovers","price_mxn":175},
+        {"id":"four_cheese","name_en":"Four Cheese","name_es":"Cuatro Quesos","price_mxn":175},
+    ]
+
+def current_period_and_fee():
+    hour = datetime.now(ZoneInfo("America/Mazatlan")).hour
+    return ("overnight", 100) if 0 <= hour < 6 else ("day", 50)
+
+@app.route("/customer", methods=["GET", "POST"])
+def customer_order():
+    if request.method == "POST":
+        language = request.form.get("language", "en")
+        phone = request.form.get("customer_phone", "").strip()
+        name = request.form.get("customer_name", "").strip()
+        address = request.form.get("address", "").strip()
+        instructions = request.form.get("instructions", "").strip()
+        if not phone or not name or not address:
+            return customer_page(language, phone, "Please enter your name and delivery address." if language == "en" else "Por favor ingresa tu nombre y dirección de entrega."), 400
+        items=[]; pizza_count=0; pizza_subtotal=0
+        for item in get_pgp_menu():
+            qty=max(0,int(request.form.get(f"qty_{item['id']}","0")))
+            if qty:
+                unit=int(item["price_mxn"]); pname=item["name_es"] if language=="es" else item["name_en"]
+                items.append((item["id"],pname,qty,unit)); pizza_count += qty; pizza_subtotal += qty*unit
+        if pizza_count == 0:
+            return customer_page(language, phone, "Please choose at least one pizza." if language == "en" else "Por favor elige al menos una pizza."), 400
+        period, fee=current_period_and_fee(); total=pizza_subtotal + fee*pizza_count; ref=new_ref()
+        with conn() as c:
+            cur=execute(c,*q("INSERT INTO orders (ref,customer_name,customer_phone,language,address,instructions,pizzas,price_each,total_mxn,period,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",(ref,name,phone,language,address,instructions,pizza_count,round(pizza_subtotal/pizza_count),total,period,"OPEN",now())))
+            order_id=cur.fetchone()["id"] if using_postgres() else cur.lastrowid
+            for pid,pname,qty,unit in items:
+                execute(c,*q("INSERT INTO order_items(order_id,pizza_id,pizza_name,quantity,unit_price_mxn) VALUES (?,?,?,?,?)",(order_id,pid,pname,qty,unit)))
+            c.commit()
+        return customer_confirmation(language,ref,items,total,period,fee,address)
+    language=request.args.get("lang","en"); language=language if language in ("en","es") else "en"
+    return customer_page(language,request.args.get("phone","").strip())
+
+def customer_page(language,phone,error=""):
+    is_es=language=="es"; menu=get_pgp_menu(); period,fee=current_period_and_fee()
+    period_label="12:00am–6:00am" if period=="overnight" else "6:00am–11:59pm"
+    title="Entrega Picante Direct" if is_es else "Picante Direct Delivery"
+    rows="".join(f"<div class='row'><div><b>{(i['name_es'] if is_es else i['name_en'])}</b><br>MX${int(i['price_mxn'])} pizza</div><input type='number' name='qty_{i['id']}' min='0' max='20' value='0'></div>" for i in menu)
+    err=f"<div class='error'>{error}</div>" if error else ""
+    return render_template_string("""<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>{{title}}</title><style>body{font-family:Arial;background:#111;color:#fff;padding:22px}.wrap{max-width:560px;margin:auto}.card{background:#1b1b1b;padding:18px;border-radius:14px;margin-bottom:16px}.row{display:flex;justify-content:space-between;align-items:center;padding:13px 0;border-bottom:1px solid #333}.row input{width:65px;padding:9px;font-size:17px;background:#222;color:#fff;border:1px solid #555;border-radius:7px;text-align:center}label{display:block;font-weight:700;margin:12px 0 6px}input[type=text],textarea{box-sizing:border-box;width:100%;padding:11px;background:#222;color:#fff;border:1px solid #555;border-radius:7px;font-size:16px}textarea{min-height:80px}.info{background:#242424;padding:12px;border-radius:9px;margin-bottom:16px}.btn{width:100%;padding:14px;border:0;border-radius:9px;background:#9cff00;color:#000;font-weight:800;font-size:18px}.error{background:#5a1f1f;padding:12px;border-radius:9px;margin-bottom:14px}</style></head><body><div class='wrap'><h1>🍕 PICANTE DIRECT</h1><p>{{title}}</p>{{err|safe}}<div class='info'><b>{{period_label}}</b><br>{{fee_text}}<br><small>Delivery pricing is calculated automatically from the current time.</small></div><form method='post'><input type='hidden' name='language' value='{{language}}'><input type='hidden' name='customer_phone' value='{{phone}}'><div class='card'><h2>{{'Elige tu pizza' if is_es else 'Choose your pizza'}}</h2>{{rows|safe}}</div><div class='card'><label>{{'Nombre' if is_es else 'Name'}}</label><input type='text' name='customer_name' required><label>{{'Dirección de entrega' if is_es else 'Delivery address'}}</label><textarea name='address' required></textarea><label>{{'Instrucciones de entrega (opcional)' if is_es else 'Delivery instructions (optional)'}}</label><textarea name='instructions'></textarea></div><button class='btn' type='submit'>{{'Continuar' if is_es else 'Continue'}}</button></form></div></body></html>""",title=title,period_label=period_label,fee_text=(f"Cargo de entrega: MX${fee} por pizza" if is_es else f"Delivery fee: MX${fee} per pizza"),is_es=is_es,language=language,phone=phone,rows=rows,err=err)
+
+def customer_confirmation(language,ref,items,total,period,fee,address):
+    is_es=language=="es"; lines="".join(f"<li>{qty} × {name} — MX${qty*unit:,}</li>" for _,name,qty,unit in items); count=sum(qty for _,_,qty,_ in items); delivery_total=fee*count
+    title="¡Pedido recibido!" if is_es else "Order received!"; body="Tu pedido fue enviado a Picante Direct para despacho." if is_es else "Your order has been sent to Picante Direct for dispatch."; label="Total a pagar al entregar" if is_es else "Total to pay on delivery"
+    return render_template_string("""<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><style>body{font-family:Arial;background:#111;color:#fff;padding:22px}.wrap{max-width:560px;margin:auto}.card{background:#1b1b1b;padding:20px;border-radius:14px}.total{font-size:24px;font-weight:800}</style></head><body><div class='wrap'><h1>🍕 {{title}}</h1><p>{{body}}</p><div class='card'><b>Reference: {{ref}}</b><ul>{{lines|safe}}</ul><p>Delivery — MX${{fee}} × {{count}} = MX${{delivery_total}}</p><div class='total'>{{label}}: MX${{total}}</div><p>{{address}}</p></div></div></body></html>""",title=title,body=body,ref=ref,lines=lines,fee=fee,count=count,delivery_total=delivery_total,label=label,total=total,address=address)
 
 # =========================================================
 # DASHBOARD
@@ -776,7 +867,10 @@ def complete_order(oid):
             pizzas = row_value(o, "pizzas")
             period = row_value(o, "period")
 
-            machine_cost = 175 * pizzas
+            item_cost_row = fetchone(c, *q("SELECT COALESCE(SUM(quantity * unit_price_mxn),0) AS n FROM order_items WHERE order_id=?", (oid,)))
+            machine_cost = int(row_value(item_cost_row, "n", 0) or 0)
+            if machine_cost == 0:
+                machine_cost = 175 * pizzas
 
             delivery_fee = (
                 50 * pizzas
@@ -1015,46 +1109,26 @@ def settlements():
 
             delivery_count = len(deliveries)
 
-            # IMPORTANT:
-            # PostgreSQL requires RETURNING id here because the
-            # settlement ID is immediately needed below.
-            if using_postgres():
-                sql, params = q(
-                    """
-                    INSERT INTO settlements
-                    (driver_id,delivery_count,amount_mxn,note,recorded_at)
-                    VALUES (?,?,?,?,?)
-                    RETURNING id
-                    """,
-                    (
-                        driver_id,
-                        delivery_count,
-                        total,
-                        request.form.get("note", ""),
-                        now()
-                    )
+            sql, params = q(
+                """
+                INSERT INTO settlements
+                (driver_id,delivery_count,amount_mxn,note,recorded_at)
+                VALUES (?,?,?,?,?)
+                RETURNING id
+                """,
+                (
+                    driver_id,
+                    delivery_count,
+                    total,
+                    request.form.get("note", ""),
+                    now()
                 )
-            else:
-                sql, params = q(
-                    """
-                    INSERT INTO settlements
-                    (driver_id,delivery_count,amount_mxn,note,recorded_at)
-                    VALUES (?,?,?,?,?)
-                    """,
-                    (
-                        driver_id,
-                        delivery_count,
-                        total,
-                        request.form.get("note", ""),
-                        now()
-                    )
-                )
+            )
 
             cur = execute(c, sql, params)
 
             if using_postgres():
-                result = cur.fetchone()
-                settlement_id = result["id"]
+                settlement_id = cur.fetchone()["id"]
             else:
                 settlement_id = cur.lastrowid
 
@@ -1148,7 +1222,7 @@ def settlements():
 
         html += f"""
         <tr>
-            <td>{row_value(d,'name')}</td>
+            <td>{row_value(d,'driver_name')}</td>
             <td>{count}</td>
             <td>MX${amount:,}</td>
             <td>{action}</td>
